@@ -1,12 +1,7 @@
 package kafka;
 
 import java.time.Duration;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 import java.util.stream.IntStream;
 
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -27,6 +22,7 @@ import org.junit.Test;
 
 import com.salesforce.kafka.test.KafkaTestUtils;
 import com.salesforce.kafka.test.junit4.SharedKafkaTestResource;
+import scala.Tuple2;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -47,18 +43,15 @@ public class TransactionTest {
         producer.initTransactions();
         producer.beginTransaction();
 
-        try {
-            IntStream.range(0, 10).forEach(i -> {
-                producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
-            });
-            producer.commitTransaction();
-        } catch (RuntimeException e) {
-            producer.abortTransaction();
-        }
+        IntStream.range(0, 10).forEach(i -> {
+            producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
+        });
+        producer.commitTransaction();
 
         KafkaConsumer<Integer, String> consumer = new KafkaConsumer<>(consumerProps(methodName));
         consumer.subscribe(Collections.singleton(methodName));
         ConsumerRecords<Integer, String> records = consumer.poll(Duration.ofMillis(5000));
+        consumer.close();
 
         assertEquals(10, records.count());
     }
@@ -89,13 +82,14 @@ public class TransactionTest {
         KafkaConsumer<Integer, String> consumer = new KafkaConsumer<>(consumerProps(methodName));
         consumer.subscribe(Collections.singleton(methodName));
         ConsumerRecords<Integer, String> records = consumer.poll(Duration.ofMillis(5000));
+        consumer.close();
 
         assertTrue(records.isEmpty());
     }
 
     @Test
     public void aConsumerShouldCommitItsOffsets() {
-        String methodName = "noMessageShouldBePublished";
+        String methodName = "aConsumerShouldCommitItsOffsets";
 
         getKafkaTestUtils()
             .createTopic(methodName, 1, (short) 1);
@@ -104,29 +98,28 @@ public class TransactionTest {
         producer.initTransactions();
         producer.beginTransaction();
 
-        try {
-            IntStream.range(0, 10).forEach(i -> {
-                producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
-            });
-            producer.commitTransaction();
-        } catch (RuntimeException e) {
-            producer.abortTransaction();
-        }
+        IntStream.range(0, 10).forEach(i -> {
+            producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
+        });
+        producer.commitTransaction();
 
         KafkaConsumer<Integer, String> consumer1 = new KafkaConsumer<>(consumerProps(methodName));
         consumer1.subscribe(Collections.singleton(methodName));
         ConsumerRecords<Integer, String> recordsC1 = consumer1.poll(Duration.ofMillis(5000));
+        consumer1.close();
 
         KafkaConsumer<Integer, String> consumer2 = new KafkaConsumer<>(consumerProps(methodName));
         consumer2.subscribe(Collections.singleton(methodName));
         ConsumerRecords<Integer, String> recordsC2 = consumer2.poll(Duration.ofMillis(5000));
+        consumer2.close();
 
-        assertTrue(recordsC1.count() == recordsC2.count());
+        assertEquals(10, recordsC1.count());
+        assertEquals(10, recordsC2.count());
     }
 
     @Test
     public void committedOffsetShouldNotBeReadAgain() {
-        String methodName = "noMessageShouldBePublished";
+        String methodName = "committedOffsetShouldNotBeReadAgain";
 
         getKafkaTestUtils()
             .createTopic(methodName, 1, (short) 1);
@@ -135,14 +128,10 @@ public class TransactionTest {
         producer.initTransactions();
         producer.beginTransaction();
 
-        try {
-            IntStream.range(0, 10).forEach(i -> {
-                producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
-            });
-            producer.commitTransaction();
-        } catch (RuntimeException e) {
-            producer.abortTransaction();
-        }
+        IntStream.range(0, 10).forEach(i -> {
+            producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
+        });
+        producer.commitTransaction();
 
         KafkaConsumer<Integer, String> consumer1 = new KafkaConsumer<>(consumerProps(methodName));
         consumer1.subscribe(Collections.singleton(methodName));
@@ -156,6 +145,40 @@ public class TransactionTest {
         consumer2.subscribe(Collections.singleton(methodName));
         ConsumerRecords<Integer, String> recordsC2 = consumer2.poll(Duration.ofMillis(5000));
 
+        assertEquals(10, recordsC1.count());
+        assertEquals(0, recordsC2.count());
+    }
+
+    @Test
+    public void committingAllOffsetOrTheLastOneIsTheSame() {
+        String methodName = "committingAllOffsetOrTheLastOneIsTheSame";
+
+        getKafkaTestUtils()
+                .createTopic(methodName, 1, (short) 1);
+
+        KafkaProducer<Integer, String> producer = new KafkaProducer<>(producerProps(methodName));
+        producer.initTransactions();
+        producer.beginTransaction();
+
+        IntStream.range(0, 10).forEach(i -> {
+            producer.send(new ProducerRecord<>(methodName, 1, "Hello, World!"));
+        });
+        producer.commitTransaction();
+
+        KafkaConsumer<Integer, String> consumer1 = new KafkaConsumer<>(consumerProps(methodName));
+        consumer1.subscribe(Collections.singleton(methodName));
+        ConsumerRecords<Integer, String> recordsC1 = consumer1.poll(Duration.ofMillis(5000));
+
+        producer.beginTransaction();
+        Map<TopicPartition, OffsetAndMetadata> offsets = lastConsumerOffsets(recordsC1);
+        producer.sendOffsetsToTransaction(offsets, methodName);
+        producer.commitTransaction();
+
+        KafkaConsumer<Integer, String> consumer2 = new KafkaConsumer<>(consumerProps(methodName));
+        consumer2.subscribe(Collections.singleton(methodName));
+        ConsumerRecords<Integer, String> recordsC2 = consumer2.poll(Duration.ofMillis(5000));
+
+        assertEquals(10, recordsC1.count());
         assertEquals(0, recordsC2.count());
     }
 
@@ -195,6 +218,23 @@ public class TransactionTest {
             long offset = records1.get(records1.size() - 1).offset();
             map.put(next, new OffsetAndMetadata(offset + 1));
         }
+        return map;
+    }
+
+    private static Map<TopicPartition, OffsetAndMetadata> lastConsumerOffsets(ConsumerRecords<Integer, String> records) {
+        List<Tuple2<TopicPartition, OffsetAndMetadata>> list = new ArrayList<>();
+        Iterator<TopicPartition> iterator = records.partitions().iterator();
+        while (iterator.hasNext()) {
+            TopicPartition next = iterator.next();
+            List<ConsumerRecord<Integer, String>> records1 = records.records(next);
+            long offset = records1.get(records1.size() - 1).offset();
+            list.add(new Tuple2<>(next, new OffsetAndMetadata(offset + 1)));
+        }
+
+        HashMap<TopicPartition, OffsetAndMetadata> map = new HashMap<>();
+        Tuple2<TopicPartition, OffsetAndMetadata> lastItem = list.get(list.size() - 1);
+        map.put(lastItem._1, lastItem._2);
+
         return map;
     }
 
