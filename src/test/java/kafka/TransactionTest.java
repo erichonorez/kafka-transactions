@@ -4,6 +4,8 @@ import java.time.Duration;
 import java.util.*;
 import java.util.stream.IntStream;
 
+import io.vavr.Tuple;
+import kafka.security.auth.Topic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -138,8 +140,11 @@ public class TransactionTest {
         ConsumerRecords<Integer, String> recordsC1 = consumer1.poll(Duration.ofMillis(5000));
 
         producer.beginTransaction();
-        producer.sendOffsetsToTransaction(consumerOffsets(recordsC1), methodName);
+        Map<TopicPartition, OffsetAndMetadata> offsets = consumerOffsets(recordsC1);
+        producer.sendOffsetsToTransaction(offsets, methodName);
         producer.commitTransaction();
+
+        consumer1.close();
 
         KafkaConsumer<Integer, String> consumer2 = new KafkaConsumer<>(consumerProps(methodName));
         consumer2.subscribe(Collections.singleton(methodName));
@@ -174,11 +179,57 @@ public class TransactionTest {
         producer.sendOffsetsToTransaction(offsets, methodName);
         producer.commitTransaction();
 
+        consumer1.close();
+
         KafkaConsumer<Integer, String> consumer2 = new KafkaConsumer<>(consumerProps(methodName));
         consumer2.subscribe(Collections.singleton(methodName));
         ConsumerRecords<Integer, String> recordsC2 = consumer2.poll(Duration.ofMillis(5000));
 
         assertEquals(10, recordsC1.count());
+        assertEquals(0, recordsC2.count());
+    }
+
+    @Test
+    public void transactionsAreOnTheLogOffsetNotPerMessage() {
+        String methodName = "transactionsAreOnTheLogOffsetNotPerMessage";
+
+        getKafkaTestUtils()
+                .createTopic(methodName, 1, (short) 1);
+
+        KafkaProducer<Integer, String> producer = new KafkaProducer<>(producerProps(methodName));
+        producer.initTransactions();
+        producer.beginTransaction();
+
+        IntStream.range(0, 2).forEach(i -> {
+            producer.send(new ProducerRecord<>(methodName, 1, String.valueOf(i)));
+        });
+        producer.commitTransaction();
+
+        // The first one fails
+        KafkaConsumer<Integer, String> consumer1 = new KafkaConsumer<>(consumerProps(methodName));
+        consumer1.subscribe(Collections.singleton(methodName));
+        ConsumerRecords<Integer, String> recordsC1 = consumer1.poll(Duration.ofMillis(5000));
+
+        assertEquals(2, recordsC1.count());
+
+        Iterator<ConsumerRecord<Integer, String>> iterator = recordsC1.iterator();
+        iterator.next();
+
+        producer.beginTransaction();
+
+        Map<TopicPartition, OffsetAndMetadata> map = new HashMap<>();
+        ConsumerRecord<Integer, String> secondRecord = iterator.next();
+        map.put(new TopicPartition(methodName, secondRecord.partition()), new OffsetAndMetadata(secondRecord.offset() + 1));
+
+        producer.sendOffsetsToTransaction(map, methodName);
+        producer.commitTransaction();
+
+        consumer1.close();
+
+        KafkaConsumer<Integer, String> consumer2 = new KafkaConsumer<>(consumerProps(methodName));
+        consumer2.subscribe(Collections.singleton(methodName));
+        ConsumerRecords<Integer, String> recordsC2 = consumer2.poll(Duration.ofMillis(5000));
+
         assertEquals(0, recordsC2.count());
     }
 
@@ -211,25 +262,23 @@ public class TransactionTest {
 
     private static Map<TopicPartition, OffsetAndMetadata> consumerOffsets(ConsumerRecords<Integer, String> records) {
         Map<TopicPartition, OffsetAndMetadata> map = new HashMap<>();
-        Iterator<TopicPartition> iterator = records.partitions().iterator();
-        while (iterator.hasNext()) {
-            TopicPartition next = iterator.next();
-            List<ConsumerRecord<Integer, String>> records1 = records.records(next);
-            long offset = records1.get(records1.size() - 1).offset();
-            map.put(next, new OffsetAndMetadata(offset + 1));
-        }
+        records.iterator().forEachRemaining(r -> {
+            map.put(
+                    new TopicPartition(r.topic(), r.partition()),
+                    new OffsetAndMetadata(r.offset() + 1)
+            );
+        });
         return map;
     }
 
     private static Map<TopicPartition, OffsetAndMetadata> lastConsumerOffsets(ConsumerRecords<Integer, String> records) {
         List<Tuple2<TopicPartition, OffsetAndMetadata>> list = new ArrayList<>();
-        Iterator<TopicPartition> iterator = records.partitions().iterator();
-        while (iterator.hasNext()) {
-            TopicPartition next = iterator.next();
-            List<ConsumerRecord<Integer, String>> records1 = records.records(next);
-            long offset = records1.get(records1.size() - 1).offset();
-            list.add(new Tuple2<>(next, new OffsetAndMetadata(offset + 1)));
-        }
+        records.iterator().forEachRemaining(r -> {
+            list.add(new Tuple2<>(
+                    new TopicPartition(r.topic(), r.partition()),
+                    new OffsetAndMetadata(r.offset() + 1)
+            ));
+        });
 
         HashMap<TopicPartition, OffsetAndMetadata> map = new HashMap<>();
         Tuple2<TopicPartition, OffsetAndMetadata> lastItem = list.get(list.size() - 1);
